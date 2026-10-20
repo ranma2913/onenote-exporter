@@ -1,9 +1,15 @@
 """Tests for onenote_export.parser.one_store module."""
 
+from pathlib import Path
+from types import SimpleNamespace
+
+from pyOneNote.OneDocument import OneDocment
+
 from onenote_export.parser.one_store import (
     ExtractedObject,
     ExtractedPage,
     ExtractedSection,
+    OneStoreParser,
     _clean_text,
     _extract_guid,
     _parse_int,
@@ -133,3 +139,220 @@ class TestExtractedDataclasses:
         assert section.file_path == "/test.one"
         assert section.display_name == "Test Section"
         assert len(section.pages) == 1
+
+
+def _identity(guid: str) -> str:
+    """Return the identity format used by pyOneNote for an object GUID."""
+    return f"<ExtendedGUID> ({guid}, 1)"
+
+
+def _metadata(
+    guid: str,
+    revision_id: str,
+    title: str,
+    *,
+    level: int = 1,
+) -> ExtractedObject:
+    return ExtractedObject(
+        obj_type="jcidPageMetaData",
+        identity=_identity(guid),
+        revision_id=revision_id,
+        properties={
+            "CachedTitleString": title,
+            "PageLevel": level,
+            "TopologyCreationTimeStamp": f"created-{revision_id}",
+        },
+    )
+
+
+def _page_node(
+    guid: str,
+    revision_id: str,
+    *,
+    title: str = "",
+    author: str = "",
+) -> ExtractedObject:
+    return ExtractedObject(
+        obj_type="jcidPageNode",
+        identity=_identity(guid),
+        revision_id=revision_id,
+        properties={
+            "CachedTitleStringFromPage": title,
+            "Author": author,
+            "LastModifiedTime": f"modified-{revision_id}",
+        },
+    )
+
+
+def _build_revision_page(
+    objects: list[ExtractedObject],
+    *,
+    page_guid: str = "page-1",
+    active_revision: str | None = "current",
+    dependencies: dict[str, str] | None = None,
+) -> ExtractedPage:
+    parser = OneStoreParser("synthetic.one")
+    parser._revision_dependencies = dependencies or {}
+    parser._active_revisions = (
+        {(0, ""): active_revision} if active_revision is not None else {}
+    )
+    pages = parser._build_pages(objects)
+    assert len(pages) == 1
+    return pages[0]
+
+
+class TestRevisionAwarePages:
+    """Page metadata follows the active revision, not traversal order."""
+
+    def test_real_properties_keep_revision_context(self):
+        path = Path(__file__).parent / "test_data" / "ExporterEval" / "Hierarchy.one"
+        parser = OneStoreParser(path)
+        with path.open("rb") as file:
+            raw = parser._extract_raw_properties(OneDocment(file))
+
+        assert raw
+        assert all(item["revision_id"] for item in raw)
+        assert parser._revision_dependencies
+        assert parser._active_revisions
+
+    def test_revision_state_uses_last_active_manifest_role(self):
+        manifest_type = type("RevisionManifestStart6FND", (), {})
+
+        def manifest(revision: str, dependent: str):
+            data = manifest_type()
+            data.rid = revision
+            data.ridDependent = dependent
+            data.RevisionRole = 1
+            return SimpleNamespace(data=data, children=[])
+
+        root = SimpleNamespace(
+            fragments=[
+                SimpleNamespace(
+                    fileNodes=[
+                        manifest("historical", ""),
+                        manifest("current", "historical"),
+                    ]
+                )
+            ]
+        )
+        parser = OneStoreParser("synthetic.one")
+
+        parser._extract_revision_state(root)
+
+        assert parser._revision_dependencies == {
+            "historical": "",
+            "current": "historical",
+        }
+        assert list(parser._active_revisions.values()) == ["current"]
+
+    def test_first_declaration_wins_when_revision_ids_match(self):
+        objects = [
+            _metadata("page-1", "current", "First title"),
+            _metadata("page-1", "current", "Later duplicate"),
+            _page_node("page-1", "current"),
+        ]
+
+        page = _build_revision_page(objects)
+
+        assert page.title == "First title"
+
+    def test_default_context_ignores_unrelated_active_context(self):
+        parser = OneStoreParser("synthetic.one")
+        parser._active_revisions = {
+            (0, ""): "current",
+            (0, "alternate"): "foreign",
+        }
+        parser._revision_contexts = {
+            "current": {(0, "")},
+            "foreign": {(0, "alternate")},
+        }
+        candidates = [
+            _metadata("page-1", "current", "Current title"),
+            _metadata("page-1", "foreign", "Foreign title"),
+        ]
+
+        selected = parser._select_revisioned(candidates)
+
+        assert selected is candidates[0]
+
+    def test_current_title_beats_empty_historical_title(self):
+        objects = [
+            _metadata("page-1", "historical", ""),
+            _metadata("page-1", "current", "Current title"),
+            _page_node("page-1", "current"),
+        ]
+
+        page = _build_revision_page(objects, dependencies={"current": "historical"})
+
+        assert page.title == "Current title"
+
+    def test_current_shorter_rename_beats_longest_historical_title(self):
+        objects = [
+            _metadata("page-1", "historical", "A much longer historical title"),
+            _metadata("page-1", "current", "Renamed"),
+            _page_node("page-1", "current"),
+        ]
+
+        page = _build_revision_page(objects, dependencies={"current": "historical"})
+
+        assert page.title == "Renamed"
+
+    def test_current_revision_inherits_metadata_from_ancestor(self):
+        objects = [
+            _metadata("page-1", "historical", "Inherited title", level=3),
+            _page_node("page-1", "current"),
+        ]
+
+        page = _build_revision_page(objects, dependencies={"current": "historical"})
+
+        assert page.title == "Inherited title"
+        assert page.level == 3
+
+    def test_stale_candidates_after_current_do_not_replace_current_metadata(self):
+        objects = [
+            _metadata("page-1", "current", "Current title", level=2),
+            _metadata("page-1", "stale", "Stale title", level=9),
+            _page_node("page-1", "current", author="Current author"),
+            _page_node("page-1", "stale", author="Stale author"),
+        ]
+
+        page = _build_revision_page(objects)
+
+        assert page.title == "Current title"
+        assert page.level == 2
+        assert page.author == "Current author"
+        assert page.last_modified == "modified-current"
+
+    def test_page_node_title_is_used_when_metadata_title_is_empty(self):
+        objects = [
+            _metadata("page-1", "current", ""),
+            _page_node("page-1", "current", title="Node title"),
+        ]
+
+        page = _build_revision_page(objects)
+
+        assert page.title == "Node title"
+
+    def test_missing_revision_metadata_preserves_first_candidate(self):
+        objects = [
+            _metadata("page-1", "first", "First title"),
+            _metadata("page-1", "second", "Second title"),
+            _page_node("page-1", "second"),
+        ]
+
+        page = _build_revision_page(objects, active_revision=None)
+
+        assert page.title == "First title"
+        assert page.level == 1
+
+    def test_single_revision_remains_unchanged(self):
+        objects = [
+            _metadata("page-1", "only", "Only title", level=4),
+            _page_node("page-1", "only", author="Author"),
+        ]
+
+        page = _build_revision_page(objects, active_revision="only")
+
+        assert page.title == "Only title"
+        assert page.level == 4
+        assert page.author == "Author"
