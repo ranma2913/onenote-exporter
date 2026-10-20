@@ -617,8 +617,34 @@ class OneStoreParser:
                         str(page_node.properties.get("CachedTitleStringFromPage", ""))
                     )
 
-            # Collect content objects for this GUID only
+            # The active page node can point to body objects in other GUID groups.
             content = [o for o in objs if o.obj_type in _CONTENT_TYPES]
+            content_guids = {content_guid}
+            child_refs = (
+                page_node.properties.get("ElementChildNodesOfVersionHistory", [])
+                if page_node
+                else []
+            )
+            if not isinstance(child_refs, list):
+                child_refs = [child_refs]
+            for child_ref in child_refs:
+                child_ref = str(child_ref)
+                child_guid = _extract_guid(child_ref) or child_ref
+                if not child_guid or child_guid in content_guids:
+                    continue
+                content_guids.add(child_guid)
+                referenced_objects: dict[
+                    tuple[str, str], list[ExtractedObject]
+                ] = {}
+                for obj in guid_objects.get(child_guid, []):
+                    if obj.obj_type in _CONTENT_TYPES:
+                        referenced_objects.setdefault(
+                            (obj.obj_type, obj.identity), []
+                        ).append(obj)
+                for candidates in referenced_objects.values():
+                    selected = self._select_revisioned(candidates)
+                    if selected:
+                        content.append(selected)
 
             page = ExtractedPage(
                 title=title or "Untitled",
