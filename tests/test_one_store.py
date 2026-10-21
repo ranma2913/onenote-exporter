@@ -171,16 +171,20 @@ def _page_node(
     *,
     title: str = "",
     author: str = "",
+    child_refs: list[str] | str | None = None,
 ) -> ExtractedObject:
+    properties = {
+        "CachedTitleStringFromPage": title,
+        "Author": author,
+        "LastModifiedTime": f"modified-{revision_id}",
+    }
+    if child_refs is not None:
+        properties["ElementChildNodesOfVersionHistory"] = child_refs
     return ExtractedObject(
         obj_type="jcidPageNode",
         identity=_identity(guid),
         revision_id=revision_id,
-        properties={
-            "CachedTitleStringFromPage": title,
-            "Author": author,
-            "LastModifiedTime": f"modified-{revision_id}",
-        },
+        properties=properties,
     )
 
 
@@ -356,3 +360,119 @@ class TestRevisionAwarePages:
         assert page.title == "Only title"
         assert page.level == 4
         assert page.author == "Author"
+
+    def test_same_guid_body_remains_included(self):
+        body = ExtractedObject(
+            obj_type="jcidRichTextOENode",
+            identity=_identity("page-1"),
+            revision_id="current",
+        )
+        page = _build_revision_page(
+            [
+                _metadata("page-1", "current", "Page"),
+                _page_node("page-1", "current"),
+                body,
+            ]
+        )
+
+        assert page.objects == [body]
+
+    def test_active_page_node_includes_separate_guid_body(self):
+        body = ExtractedObject(
+            obj_type="jcidRichTextOENode",
+            identity=_identity("body-1"),
+            revision_id="current",
+        )
+        page = _build_revision_page(
+            [
+                _metadata("page-1", "current", "Page"),
+                _page_node(
+                    "page-1",
+                    "current",
+                    child_refs="body-1",
+                ),
+                body,
+            ]
+        )
+
+        assert page.objects == [body]
+
+    def test_inactive_page_node_reference_is_not_included(self):
+        active_body = ExtractedObject(
+            obj_type="jcidRichTextOENode",
+            identity=_identity("active-body"),
+            revision_id="current",
+        )
+        stale_body = ExtractedObject(
+            obj_type="jcidRichTextOENode",
+            identity=_identity("stale-body"),
+            revision_id="stale",
+        )
+        page = _build_revision_page(
+            [
+                _metadata("page-1", "current", "Page"),
+                _page_node(
+                    "page-1",
+                    "current",
+                    child_refs=[_identity("active-body")],
+                ),
+                _page_node(
+                    "page-1",
+                    "stale",
+                    child_refs=[_identity("stale-body")],
+                ),
+                active_body,
+                stale_body,
+            ]
+        )
+
+        assert page.objects == [active_body]
+
+    def test_repeated_page_node_references_do_not_duplicate_body(self):
+        body = ExtractedObject(
+            obj_type="jcidRichTextOENode",
+            identity=_identity("body-1"),
+            revision_id="current",
+        )
+        page = _build_revision_page(
+            [
+                _metadata("page-1", "current", "Page"),
+                _page_node(
+                    "page-1",
+                    "current",
+                    child_refs=[_identity("body-1"), _identity("body-1")],
+                ),
+                body,
+            ]
+        )
+
+        assert page.objects == [body]
+
+    def test_referenced_body_uses_active_revision(self):
+        current_body = ExtractedObject(
+            obj_type="jcidRichTextOENode",
+            identity=_identity("body-1"),
+            revision_id="current",
+            properties={"RichEditTextUnicode": "current"},
+        )
+        stale_body = ExtractedObject(
+            obj_type="jcidRichTextOENode",
+            identity=_identity("body-1"),
+            revision_id="stale",
+            properties={"RichEditTextUnicode": "stale"},
+        )
+        page = _build_revision_page(
+            [
+                _metadata("page-1", "current", "Page"),
+                _page_node(
+                    "page-1",
+                    "current",
+                    child_refs=[_identity("body-1")],
+                ),
+                current_body,
+                stale_body,
+            ],
+            dependencies={"current": "stale"},
+        )
+
+        assert page.objects == [current_body]
